@@ -35,6 +35,28 @@ _TRANSPORT_FAILURE_TYPES = frozenset(
     },
 )
 
+# A 400 that names the context or the input length is the one rejection a single item can
+# explain: the provider enforces a token window while ``_truncate`` only estimates a character
+# budget, and the two disagree on CJK-heavy text. Retrying that item under a smaller budget
+# recovers its vector; every other failure stays on the generic path.
+_INPUT_LENGTH_STATUS_CODES = frozenset({400, 413, 422})
+
+_INPUT_LENGTH_ERROR_TYPES = frozenset({"ContextLengthExceededError", "ContextWindowExceededError"})
+
+_INPUT_LENGTH_ERROR_MARKERS = (
+    "context length",
+    "context_length",
+    "maximum context",
+    "max context",
+    "input length",
+    "sequence length",
+    "too many tokens",
+    "token limit",
+)
+
+# One bounded shortening retry: the character budget is divided by this factor.
+_INPUT_LENGTH_SHRINK_DIVISOR = 2
+
 
 @R.register("local")
 class LocalEmbeddingStore(BaseEmbeddingStore):
@@ -206,6 +228,7 @@ class LocalEmbeddingStore(BaseEmbeddingStore):
         return out
 
     async def _call_with_retry(self, texts: list[str], **kwargs) -> list[list[float] | None] | None:
+        shortened = False
         for attempt in range(self.max_retries):
             try:
                 result = await self.as_embedding(texts, **kwargs)
@@ -256,6 +279,25 @@ class LocalEmbeddingStore(BaseEmbeddingStore):
                         continue
                     self.logger.exception("Embedding request failed: provider-wide error, not splitting")
                     break
+                if not shortened and len(texts) == 1 and self._is_input_length_failure(error):
+                    # The provider enforces a token window while ``_truncate`` only estimates a
+                    # character budget, so an item that passed the estimate can still be rejected
+                    # as too long. One bounded retry under a smaller budget recovers the vector
+                    # instead of leaving the chunk unindexed. Only the request shrinks: the
+                    # caller keeps the full source text and the vector space is unchanged. The
+                    # retry consumes one attempt, so ``max_retries`` stays the upper bound on the
+                    # provider calls made for a single item.
+                    shorter = self._truncate(texts[0], max_length=self._shorter_input_limit())
+                    if shorter != texts[0]:
+                        self.logger.warning(
+                            f"Embedding input rejected as too long; retrying with a smaller budget "
+                            f"(chars={len(texts[0])} -> {len(shorter)})",
+                        )
+                        texts = [shorter]
+                        shortened = True
+                        if attempt < self.max_retries - 1:
+                            await asyncio.sleep(2**attempt)
+                        continue
                 self.logger.exception("Embedding request failed")
                 self.is_healthy = False
                 if len(texts) > 1:
@@ -272,7 +314,8 @@ class LocalEmbeddingStore(BaseEmbeddingStore):
         the damage to the item that actually failed and keeps the remaining vectors usable.
         Each single-item request goes back through ``_call_with_retry`` so a transient
         failure (429, connection error, timeout) still gets the existing backoff and retry
-        policy instead of losing the vector; a one-item request never splits again.
+        policy instead of losing the vector, and so an item that is still rejected as too long
+        gets its one bounded input-shortening retry; a one-item request never splits again.
         """
         results: list[list[float] | None] = []
         for text in texts:
@@ -316,6 +359,34 @@ class LocalEmbeddingStore(BaseEmbeddingStore):
             "NotFoundError",
             "InternalServerError",
         )
+
+    @staticmethod
+    def _is_input_length_failure(error: Exception) -> bool:
+        """Return whether the provider rejected a single input as too long.
+
+        Only the status codes a provider uses for an over-long input are accepted, and the
+        message or the error class has to name the input length. Any other ``400`` stays on
+        the generic path, so an unrelated bad request is never answered with a smaller input.
+        """
+        status = getattr(error, "status_code", None)
+        if isinstance(status, int) and status not in _INPUT_LENGTH_STATUS_CODES:
+            return False
+        if type(error).__name__ in _INPUT_LENGTH_ERROR_TYPES:
+            return True
+        return any(marker in LocalEmbeddingStore._error_text(error) for marker in _INPUT_LENGTH_ERROR_MARKERS)
+
+    @staticmethod
+    def _error_text(error: Exception) -> str:
+        """Flatten an exception and its OpenAI-compatible body into one lowercase string."""
+        parts = [str(error)]
+        body = getattr(error, "body", None)
+        if isinstance(body, dict):
+            parts.append(str(body))
+        return " ".join(parts).lower()
+
+    def _shorter_input_limit(self) -> int:
+        """Return the smaller character budget used for one input-length retry."""
+        return max(1, max(0, self.max_input_length) // _INPUT_LENGTH_SHRINK_DIVISOR)
 
     @staticmethod
     def _is_transient_provider_failure(error: Exception) -> bool:

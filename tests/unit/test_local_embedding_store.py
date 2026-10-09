@@ -1179,3 +1179,185 @@ def test_provider_wide_not_found_errors_are_not_split(monkeypatch):
         assert not sleeps
 
     run(go())
+
+
+# -- Bounded input-shortening recovery for over-limit items --
+
+
+class ShrinkablePerItemLimitAsEmbedding:
+    """Reject any text longer than ``max_chars``, so only a shorter request can be embedded.
+
+    Mirrors a provider that enforces a token window the store's character budget cannot see:
+    the same text stays rejected no matter how often it is resent, and the only way to keep
+    the vector is to send less of it.
+    """
+
+    dimensions = 2
+    vector_space_id = "fakespace000"
+
+    def __init__(self, max_chars: int):
+        self.max_chars = max_chars
+        self.batch_sizes: list[int] = []
+        self.embedded_texts: list[str] = []
+
+    def initialize_model(self):
+        """Mirror the real component's idempotent initialization hook."""
+
+    async def __call__(self, texts: list[str], **_kwargs):
+        self.batch_sizes.append(len(texts))
+        if any(len(text) > self.max_chars for text in texts):
+            raise ContextLengthError("the input length exceeds the context length")
+        self.embedded_texts.extend(texts)
+        return [[1.0, 0.0] for _ in texts]
+
+
+class UnrelatedBadRequestError(Exception):
+    """A 400 that has nothing to do with the input length, e.g. a malformed parameter."""
+
+    status_code = 400
+
+
+class UnrelatedBadRequestAsEmbedding:
+    """Always fail with a 400 that does not name the input length."""
+
+    dimensions = 2
+    vector_space_id = "fakespace000"
+
+    def __init__(self):
+        self.batch_sizes: list[int] = []
+
+    def initialize_model(self):
+        """Mirror the real component's idempotent initialization hook."""
+
+    async def __call__(self, texts: list[str], **_kwargs):
+        self.batch_sizes.append(len(texts))
+        raise UnrelatedBadRequestError("unsupported encoding format")
+
+
+def test_over_limit_item_is_recovered_by_a_shorter_request():
+    """A per-item rejection that survives isolation must be retried with less input."""
+
+    async def go():
+        provider = ShrinkablePerItemLimitAsEmbedding(max_chars=40)
+        store = LocalEmbeddingStore(
+            name="t_local_embedding_shrink_recovery",
+            enable_cache=False,
+            max_input_length=80,
+        )
+        store.as_embedding = provider
+        long_text = "x" * 80
+
+        results = await store._call_with_retry(["ok", long_text, "also ok"])
+
+        assert results == [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]
+        assert provider.batch_sizes == [3, 1, 1, 1, 1]
+        assert long_text not in provider.embedded_texts
+        assert provider.embedded_texts == ["ok", "x" * 40, "also ok"]
+
+    run(go())
+
+
+def test_shortened_retry_leaves_the_configured_budget_alone():
+    """Recovery is per request: the shared character budget must not shrink for everyone."""
+
+    async def go():
+        provider = ShrinkablePerItemLimitAsEmbedding(max_chars=40)
+        store = LocalEmbeddingStore(
+            name="t_local_embedding_shrink_budget",
+            enable_cache=False,
+            max_input_length=80,
+        )
+        store.as_embedding = provider
+
+        assert await store._call_with_retry(["x" * 80]) == [[1.0, 0.0]]
+        assert store.max_input_length == 80
+
+    run(go())
+
+
+def test_batch_rejected_for_one_item_keeps_every_vector():
+    """The end-to-end promise: an over-limit chunk no longer costs its batch mates or itself."""
+
+    async def go():
+        store = LocalEmbeddingStore(
+            name="t_local_embedding_shrink_nodes",
+            enable_cache=False,
+            max_input_length=80,
+        )
+        store.as_embedding = ShrinkablePerItemLimitAsEmbedding(max_chars=40)
+        nodes = [EmbNode(text="first"), EmbNode(text="y" * 80), EmbNode(text="third")]
+
+        await store.get_node_embeddings(nodes)
+
+        assert all(node.embedding is not None for node in nodes)
+
+    run(go())
+
+
+def test_input_length_retry_is_skipped_when_the_input_cannot_shrink():
+    """A rejection that a smaller budget cannot change must not be retried at all."""
+
+    async def go():
+        provider = ShrinkablePerItemLimitAsEmbedding(max_chars=8)
+        store = LocalEmbeddingStore(
+            name="t_local_embedding_shrink_noop",
+            enable_cache=False,
+            max_input_length=8192,
+        )
+        store.as_embedding = provider
+
+        assert await store._call_with_retry(["x" * 64]) is None
+        assert provider.batch_sizes == [1]
+
+    run(go())
+
+
+def test_shortened_retry_is_bounded_by_max_retries():
+    """With no retry budget left the store gives up instead of resending shorter inputs forever."""
+
+    async def go():
+        provider = ShrinkablePerItemLimitAsEmbedding(max_chars=40)
+        store = LocalEmbeddingStore(
+            name="t_local_embedding_shrink_bounded",
+            enable_cache=False,
+            max_input_length=80,
+            max_retries=1,
+        )
+        store.as_embedding = provider
+
+        assert await store._call_with_retry(["x" * 80]) is None
+        assert provider.batch_sizes == [1]
+
+    run(go())
+
+
+def test_unrelated_bad_request_is_not_retried_with_a_shorter_input():
+    """Only a 400 that names the input length may be answered with less input."""
+
+    async def go():
+        provider = UnrelatedBadRequestAsEmbedding()
+        store = LocalEmbeddingStore(
+            name="t_local_embedding_shrink_unrelated",
+            enable_cache=False,
+            max_input_length=80,
+        )
+        store.as_embedding = provider
+
+        assert await store._call_with_retry(["x" * 80]) is None
+        assert provider.batch_sizes == [1]
+
+    run(go())
+
+
+def test_input_length_classifier_only_accepts_length_failures():
+    """The classifier must not swallow other statuses, which have their own handlers."""
+
+    store = LocalEmbeddingStore(name="t_local_embedding_input_length_classifier")
+
+    assert store._is_input_length_failure(ContextLengthError()) is True
+    assert store._is_input_length_failure(AuthenticationError("bad key")) is False
+    assert store._is_input_length_failure(PermissionDeniedError("forbidden")) is False
+    assert store._is_input_length_failure(NotFoundError("no such model")) is False
+    assert store._is_input_length_failure(InternalServerError("boom")) is False
+    assert store._is_input_length_failure(RateLimitError("Requests are too frequent")) is False
+    assert store._is_input_length_failure(UnrelatedBadRequestError("unsupported encoding format")) is False
