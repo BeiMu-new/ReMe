@@ -268,10 +268,16 @@ class LocalEmbeddingStore(BaseEmbeddingStore):
         self,
         texts: list[str],
         *,
+        isolated: bool = False,
         terminal_failure: list[bool] | None = None,
         **kwargs,
     ) -> list[list[float] | None] | None:
         """Answer a batch, retrying transient failures and isolating input ones.
+
+        ``isolated`` marks a single-item attempt made while isolating a rejected batch. Such an
+        attempt keeps the store's transport backoff, because it is the last chance to keep that
+        one vector; every other request leaves transport retries to the embedding wrapper and the
+        provider SDK, which already own them.
 
         ``terminal_failure`` is an optional out-parameter. When the caller passes a list,
         it is set to ``[True]`` if this call gave up on a failure that no remaining item
@@ -293,13 +299,22 @@ class LocalEmbeddingStore(BaseEmbeddingStore):
                 if result and len(result) == len(texts):
                     return result
             except Exception as error:
-                if self._is_transient_transport_failure(error):
+                if self._is_transport_failure(error):
                     # A connection failure or a timeout describes the endpoint, not any single
-                    # item: retry the very same request with the usual backoff instead of
-                    # fanning out into per-item requests that would fail the same way.
-                    if attempt < self.max_retries - 1:
-                        await asyncio.sleep(2**attempt)
-                    continue
+                    # item, so this request is never split per item. Which layer retries it is
+                    # explicit: an isolated single-item attempt keeps the store's backoff, while
+                    # any other request is left to the layers below, which already own that retry
+                    # -- the OpenAI model retries a batch max_retries + 1 times and the SDK retries
+                    # each of those attempts, so a batch they answer after 12 attempts used to
+                    # reach the provider 36 times with this store retrying on top of them.
+                    if isolated:
+                        if attempt < self.max_retries - 1:
+                            await asyncio.sleep(2**attempt)
+                        continue
+                    self.logger.exception("Embedding request failed: transport error, not splitting")
+                    self.is_healthy = False
+                    stop()
+                    break
                 if self._is_rate_limited(error):
                     if attempt < self.max_retries - 1:
                         delay = 2**attempt
@@ -339,8 +354,8 @@ class LocalEmbeddingStore(BaseEmbeddingStore):
                     # below it -- a batch the SDK answered after 12 attempts became 36 once this
                     # store retried on top of it. Retry ownership therefore stays with those
                     # layers: a caller that wants a longer budget configures it there instead of
-                    # stacking another silent loop here. Transport failures keep their retry
-                    # above because they describe a connection that no lower layer has reported.
+                    # stacking another silent loop here. A transport failure is left to them for
+                    # the same reason; it only skips the per-item split.
                     self.logger.exception("Embedding request failed: provider-wide error, not splitting")
                     stop()
                     break
@@ -378,16 +393,22 @@ class LocalEmbeddingStore(BaseEmbeddingStore):
         Provider-side request errors, such as a per-item context-length limit, reject the
         whole batch and would otherwise cost every vector in it. Isolating each item bounds
         the damage to the item that actually failed and keeps the remaining vectors usable.
-        Each single-item request goes back through ``_call_with_retry`` so a transient
-        failure (429, connection error, timeout) still gets the existing backoff and retry
-        policy instead of losing the vector; a one-item request never splits again.
+        Each single-item request goes back through ``_call_with_retry`` with ``isolated=True`` so
+        a rate limit and a transient transport failure still get the store's backoff instead of
+        losing the vector; a provider-wide failure ends the work for the whole batch rather than
+        being asked for every remaining item, and a one-item request never splits again.
         When the loop stops on a provider-wide failure, ``terminal_failure`` is set for the
         caller so the vectors recovered before it are not read as a healthy provider.
         """
         results: list[list[float] | None] = []
         for index, text in enumerate(texts):
             terminal: list[bool] = []
-            single = await self._call_with_retry([text], terminal_failure=terminal, **kwargs)
+            single = await self._call_with_retry(
+                [text],
+                isolated=True,
+                terminal_failure=terminal,
+                **kwargs,
+            )
             if single:
                 results.append(single[0])
                 continue
@@ -410,12 +431,15 @@ class LocalEmbeddingStore(BaseEmbeddingStore):
         return results
 
     @staticmethod
-    def _is_transient_transport_failure(error: Exception) -> bool:
-        """Return whether an error is a transient transport failure worth retrying.
+    def _is_transport_failure(error: Exception) -> bool:
+        """Return whether an error describes a transport failure rather than a rejected input.
 
         Covers the built-in socket errors as well as the provider/httpx exceptions that describe
         a connection failure or a timeout. Transport failures are provider-wide: no individual
-        input can be blamed, so the same request is retried and never split per item.
+        input can be blamed, so the request is never split per item. Who retries them is explicit
+        in the transport branch of ``_call_with_retry``: an isolated single-item attempt keeps the
+        store's backoff because it is the last chance to keep that vector, while every other
+        request leaves the retry to the layers below, which already own it.
         """
         if isinstance(error, (TimeoutError, ConnectionError, OSError)):
             return True
