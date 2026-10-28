@@ -281,22 +281,18 @@ class LocalEmbeddingStore(BaseEmbeddingStore):
 
     @staticmethod
     def _shrink_rejected_input(text: str) -> str | None:
-        """Return a strictly smaller request built from the text the provider rejected.
+        """Return a strictly smaller request, or ``None`` when there is none.
 
-        The rejected text is the only reliable starting point: a budget derived from the
-        configured ``max_input_length`` can still sit above the provider's real per-item
-        limit, or leave an already short input untouched so nothing is re-sent. Halving the
-        *current* request keeps every round an actual reduction, and the caller bounds the
-        number of rounds so an impossible limit cannot spin.
-
-        Returns ``None`` when no smaller non-empty request can be produced.
+        The rejected text is the only reliable starting point: a budget derived
+        from the configured ``max_input_length`` can still sit above the
+        provider's real per-item limit, or leave an already short input
+        untouched so nothing is re-sent. Halving the *current* request keeps
+        every round an actual reduction, and the caller bounds the number of
+        rounds so an impossible limit cannot spin.
         """
         if len(text) <= 1:
             return None
-        target = max(1, len(text) // 2)
-        if target >= len(text):
-            return None
-        return text[:target]
+        return text[: len(text) // 2]
 
     async def _embed_individually(self, texts: list[str], **kwargs) -> _EmbeddingResult:
         """Keep healthy siblings, stopping when a failure is no longer specific to an input."""

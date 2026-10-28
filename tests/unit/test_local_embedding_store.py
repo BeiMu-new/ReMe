@@ -2069,8 +2069,13 @@ async def test_shrinking_stops_when_no_smaller_request_can_fit():
 
 
 @pytest.mark.asyncio
-async def test_repeated_recovery_reuses_the_same_shrinking_path():
-    """A second rebuild must recover the same item without any new configuration."""
+async def test_repeated_request_recovery_reuses_the_same_shrinking_path():
+    """Two consecutive requests on one store both recover the same item.
+
+    This is request-level repeatability only: no rebuild is performed and the gate is not
+    involved. The rebuild-side regression lives in
+    ``test_file_store_consistency.py::test_second_reindex_recovers_the_same_over_limit_chunk``.
+    """
     provider = ShrinkablePerItemLimitAsEmbedding(max_chars=2048)
     store = LocalEmbeddingStore(
         name="t_local_embedding_shrink_repeat",
